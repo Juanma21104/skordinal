@@ -7,7 +7,7 @@ from collections.abc import Callable
 from sklearn.metrics import accuracy_score, make_scorer, mean_absolute_error
 
 from ._metrics import (
-    accuracy_off1,
+    accuracy_off1_score,
     average_mean_absolute_error,
     geometric_mean,
     gmsec,
@@ -44,30 +44,14 @@ _SCORERS: dict[str, Callable] = {
         maximum_mean_absolute_error, greater_is_better=False
     ),
     "mean_zero_one_error": make_scorer(mean_zero_one_error, greater_is_better=False),
-    "accuracy": make_scorer(accuracy_score),
-    "accuracy_off1": make_scorer(accuracy_off1),
+    "accuracy_score": make_scorer(accuracy_score),
+    "accuracy_off1_score": make_scorer(accuracy_off1_score),
     "geometric_mean": make_scorer(geometric_mean),
     "gmsec": make_scorer(gmsec),
     "kendalls_tau": make_scorer(kendalls_tau),
     "minimum_sensitivity": make_scorer(minimum_sensitivity),
     "spearmans_rho": make_scorer(spearmans_rho),
     "weighted_kappa": make_scorer(weighted_kappa),
-    "neg_amae": make_scorer(average_mean_absolute_error, greater_is_better=False),
-    "neg_mae": make_scorer(mean_absolute_error, greater_is_better=False),
-    "neg_mmae": make_scorer(maximum_mean_absolute_error, greater_is_better=False),
-    "neg_mze": make_scorer(mean_zero_one_error, greater_is_better=False),
-    "neg_rps": make_scorer(ranked_probability_score, greater_is_better=False),
-    "amae": make_scorer(average_mean_absolute_error, greater_is_better=False),
-    "ccr": make_scorer(accuracy_score),
-    "gm": make_scorer(geometric_mean),
-    "mae": make_scorer(mean_absolute_error, greater_is_better=False),
-    "mmae": make_scorer(maximum_mean_absolute_error, greater_is_better=False),
-    "ms": make_scorer(minimum_sensitivity),
-    "mze": make_scorer(mean_zero_one_error, greater_is_better=False),
-    "rps": make_scorer(ranked_probability_score, greater_is_better=False),
-    "spearman": make_scorer(spearmans_rho),
-    "tkendall": make_scorer(kendalls_tau),
-    "wkappa": make_scorer(weighted_kappa),
 }
 
 __all__ = ["get_ordinal_scorer", "list_ordinal_scorers"]
@@ -129,7 +113,7 @@ def list_ordinal_scorers() -> list[str]:
     <class 'list'>
     >>> "neg_mean_absolute_error" in all_scorers
     True
-    >>> "ccr" in all_scorers
+    >>> "accuracy_score" in all_scorers
     True
 
     """
