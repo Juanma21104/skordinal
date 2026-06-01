@@ -83,21 +83,14 @@ def test_run_experiment(tmp_path, experiment_conf, svm_conf):
     runs_dir = Path(experiment_conf["output_folder"])
     assert runs_dir.exists()
 
-    exp_dirs = list(runs_dir.iterdir())
-    npt.assert_equal(len(exp_dirs), 1)
-    exp_dir = exp_dirs[0]
-
-    svm_dir = exp_dir / "balance-SVM"
+    svm_dir = runs_dir / "SVM" / "balance"
     assert svm_dir.exists()
 
-    metrics_csv = svm_dir / "balance-SVM.csv"
+    metrics_csv = svm_dir / "report.csv"
     df = pd.read_csv(metrics_csv, index_col=0)
     npt.assert_equal(df.shape[0], 2)
-    metric_block = df.iloc[:, -12:]
-    npt.assert_equal(metric_block.shape, (2, 12))
-    npt.assert_equal(
-        all(metric_block[c].dtype == np.float64 for c in metric_block.columns), True
-    )
+    npt.assert_equal(df.shape[1], 12)
+    npt.assert_equal(all(df[c].dtype == np.float64 for c in df.columns), True)
 
     models = list((svm_dir / "models").iterdir())
     npt.assert_equal(len(models), 2)
@@ -105,17 +98,17 @@ def test_run_experiment(tmp_path, experiment_conf, svm_conf):
     predictions = list((svm_dir / "predictions").iterdir())
     npt.assert_equal(len(predictions), 4)
 
-    train_summary = pd.read_csv(exp_dir / "train_summary.csv")
-    npt.assert_equal(train_summary.shape, (1, 13))
+    train_summary = pd.read_csv(runs_dir / "train_summary.csv")
+    npt.assert_equal(train_summary.shape, (1, 15))
     npt.assert_equal(
-        all(train_summary[c].dtype == np.float64 for c in train_summary.columns[1:]),
+        all(train_summary[c].dtype == np.float64 for c in train_summary.columns[2:-1]),
         True,
     )
 
-    test_summary = pd.read_csv(exp_dir / "test_summary.csv")
-    npt.assert_equal(test_summary.shape, (1, 13))
+    test_summary = pd.read_csv(runs_dir / "test_summary.csv")
+    npt.assert_equal(test_summary.shape, (1, 15))
     npt.assert_equal(
-        all(test_summary[c].dtype == np.float64 for c in test_summary.columns[1:]),
+        all(test_summary[c].dtype == np.float64 for c in test_summary.columns[2:-1]),
         True,
     )
 

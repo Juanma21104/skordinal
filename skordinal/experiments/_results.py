@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
-import pickle
-from collections import OrderedDict
+import json
+import math
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+import joblib
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator
+
+
+def _check_split(split: str, *, allow_both: bool) -> None:
+    """Raise ValueError when *split* is not a recognised value."""
+    valid = {"test", "train", "both"} if allow_both else {"test", "train"}
+    if split not in valid:
+        raise ValueError(f"split must be one of {sorted(valid)!r}, got {split!r}.")
 
 
 @dataclass(frozen=True)
@@ -29,17 +37,16 @@ class ExperimentResult:
     resample_id : str
         Partition identifier.
 
-    train_predicted_y : ndarray
+    train_predicted_y : ndarray of shape (n_train_samples,)
         Class predictions on the training partition.
 
-    test_predicted_y : ndarray or None
+    test_predicted_y : ndarray of shape (n_test_samples,) or None
         Class predictions on the test partition. ``None`` if no test partition
         was available.
 
-    y_proba : ndarray or None
-        Class probability estimates on the test partition, shape
-        ``(n_samples, n_classes)``. ``None`` if the estimator does not support
-        ``predict_proba``.
+    y_proba : ndarray of shape (n_test_samples, n_classes) or None
+        Class probability estimates on the test partition. ``None`` if the
+        estimator does not support ``predict_proba``.
 
     train_metrics : dict
         Metric values computed on the training partition, including timing.
@@ -53,6 +60,14 @@ class ExperimentResult:
     best_model : estimator
         Fitted estimator selected during cross-validation or direct fit.
 
+    train_true_y : ndarray of shape (n_train_samples,) or None, default=None
+        True class labels for the training partition. When provided, predictions
+        CSV files include a ``y_true`` column alongside ``y_pred``.
+
+    test_true_y : ndarray of shape (n_test_samples,) or None, default=None
+        True class labels for the test partition. When provided, the test
+        predictions CSV file includes a ``y_true`` column alongside ``y_pred``.
+
     """
 
     dataset_name: str
@@ -65,36 +80,47 @@ class ExperimentResult:
     test_metrics: dict[str, Any]
     best_params: dict[str, Any]
     best_model: BaseEstimator
+    train_true_y: np.ndarray | None = None
+    test_true_y: np.ndarray | None = None
 
 
 class Results:
     """Handle all information from an experiment that needs to be saved.
 
-    This information will be saved into an specified folder.
-
     Parameters
     ----------
-    output_folder : Path
-        Base directory for storing experimental results.
+    output_folder : str or Path
+        Directory where all results for this run will be stored. Used directly
+        as the experiment root; no timestamp subfolder is created.
 
     Attributes
     ----------
     _experiment_folder : Path
-        Path where all the information about the actual experiment will be saved. This
-        folder will have the next format: 'exp-YY-MM-DD-hh-mm-ss'.
+        Path to the experiment folder.
+
+    Notes
+    -----
+    On-disk layout under :attr:`_experiment_folder`::
+
+        train_summary.csv
+        test_summary.csv
+        <classifier_name>/
+            <dataset_name>/
+                report.csv
+                params.json
+                predictions/
+                    train_<resample_id>.csv
+                    test_<resample_id>.csv
+                models/
+                    <resample_id>.joblib
+
+    The root-level ``train_summary.csv`` and ``test_summary.csv`` files are
+    written by :meth:`save_summary` and are absent until it is called.
 
     """
 
-    def __init__(self, output_folder: Path) -> None:
-        # Getting experiment's folder name
-        folder_name = (
-            "exp-"
-            + date.today().strftime("%y-%m-%d")
-            + "-"
-            + datetime.now().strftime("%H-%M-%S")
-        )
-
-        self._experiment_folder = Path(output_folder) / folder_name
+    def __init__(self, output_folder: str | Path) -> None:
+        self._experiment_folder = Path(output_folder)
 
     def save(
         self,
@@ -110,221 +136,348 @@ class Results:
             All data produced by a single classifier run on one partition.
 
         save_model : bool, default=True
-            Whether to pickle the fitted model to disk.
+            Whether to persist the fitted model to disk with joblib.
 
         Raises
         ------
         OSError
             If the folder cannot be created.
 
+        Examples
+        --------
+        >>> from skordinal.experiments import Results
+        >>> results = Results("/path/to/my-run")  # doctest: +SKIP
+        >>> results.save(result)  # doctest: +SKIP
+
         """
-        dataset_folder = self._experiment_folder / (
-            result.dataset_name + "-" + result.classifier_name
+        base_dir, models_dir, pred_dir = self._ensure_dirs(
+            result.classifier_name, result.dataset_name, save_model=save_model
         )
-        models_folder = dataset_folder / "models"
-        predictions_folder = dataset_folder / "predictions"
 
-        # Creating folder for this dataset-configuration if necessary
-        if not dataset_folder.exists():
-            try:
-                if save_model:
-                    models_folder.mkdir(parents=True)
-                else:
-                    predictions_folder.mkdir(parents=True)
-                predictions_folder.mkdir(exist_ok=True)
-
-            except OSError:
-                raise OSError(
-                    f"Could not create folder {dataset_folder} (or subfolders) "
-                    "to store results."
-                )
-
-        # Saving partition model
+        # Write model and prediction CSVs
         if save_model:
-            models_folder.mkdir(exist_ok=True)
-            model_filename = (
-                result.dataset_name
-                + "-"
-                + result.classifier_name
-                + "."
-                + result.resample_id
-            )
-            with open(models_folder / model_filename, "wb") as output:
-                pickle.dump(result.best_model, output)
-
-        # Saving model predictions
-        pred_filename = (
-            result.dataset_name
-            + "-"
-            + result.classifier_name
-            + "."
-            + result.resample_id
-        )
-        if result.train_predicted_y is not None:
-            np.savetxt(
-                predictions_folder / f"train_{pred_filename}",
-                result.train_predicted_y,
-                fmt="%d",
-            )
-
+            joblib.dump(result.best_model, models_dir / f"{result.resample_id}.joblib")
+        train_df = pd.DataFrame({"y_pred": result.train_predicted_y})
+        if result.train_true_y is not None:
+            train_df.insert(0, "y_true", result.train_true_y)
+        train_df.to_csv(pred_dir / f"train_{result.resample_id}.csv", index=False)
         if result.test_predicted_y is not None:
-            np.savetxt(
-                predictions_folder / f"test_{pred_filename}",
-                result.test_predicted_y,
-                fmt="%d",
+            test_df = pd.DataFrame({"y_pred": result.test_predicted_y})
+            if result.test_true_y is not None:
+                test_df.insert(0, "y_true", result.test_true_y)
+            test_df.to_csv(pred_dir / f"test_{result.resample_id}.csv", index=False)
+
+        self._append_report_row(result, base_dir)
+
+        # Upsert params entry in params.json
+        json_path = base_dir / "params.json"
+        params: dict[str, Any] = {}
+        if json_path.is_file():
+            params = json.loads(json_path.read_text(encoding="utf-8"))
+        params[str(result.resample_id)] = dict(result.best_params)
+        json_path.write_text(json.dumps(params, indent=2), encoding="utf-8")
+
+    def _ensure_dirs(
+        self, classifier_name: str, dataset_name: str, *, save_model: bool
+    ) -> tuple[Path, Path, Path]:
+        """Create required sub-directories and return ``(base_dir, models_dir, pred_dir)``."""
+        base = self._experiment_folder / classifier_name / dataset_name
+        pred_dir = base / "predictions"
+        models_dir = base / "models"
+        try:
+            pred_dir.mkdir(parents=True, exist_ok=True)
+            if save_model:
+                models_dir.mkdir(exist_ok=True)
+        except OSError:
+            raise OSError(
+                f"Could not create folder {base} (or subfolders) to store results."
             )
+        return base, models_dir, pred_dir
 
-        if result.y_proba is not None:
-            np.savetxt(
-                predictions_folder / f"proba_{pred_filename}",
-                result.y_proba,
-            )
+    def _append_report_row(self, result: ExperimentResult, base_dir: Path) -> None:
+        """Append one metrics row to ``report.csv``."""
+        row: dict[str, Any] = {**result.train_metrics, **result.test_metrics}
 
-        dataframe_row = OrderedDict()
-        # Adding best parameters as first elements in row
-        for p_name, p_value in result.best_params.items():
-            # If some ensemble method has been used, then one of its parameters will be
-            # a dictionary containing the best parameters found for the base classifier.
-            if isinstance(p_value, dict):
-                for k, v in p_value.items():
-                    dataframe_row[k] = v
-            else:
-                dataframe_row[p_name] = p_value
+        csv_path = base_dir / "report.csv"
+        df = pd.DataFrame([row], index=pd.Index([result.resample_id], dtype=str))
+        if csv_path.is_file():
+            existing = pd.read_csv(csv_path, index_col=0)
+            existing.index = existing.index.astype(str)
+            df = pd.concat([existing, df])
+        df.to_csv(csv_path)
 
-        # Concatenating train and test metrics
-        for (tm_name, tm_value), (ts_name, ts_value) in zip(
-            result.train_metrics.items(), result.test_metrics.items()
-        ):
-            dataframe_row[tm_name] = tm_value
-            dataframe_row[ts_name] = ts_value
-
-        # Adding row to existing DataFrame or creating new one
-        df_path = dataset_folder / f"{result.dataset_name}-{result.classifier_name}.csv"
-
-        df = pd.DataFrame([dataframe_row], index=[result.resample_id])
-        if df_path.is_file():
-            previous_df = pd.read_csv(df_path, index_col=[0])
-            df = pd.concat([previous_df, df], axis=0)
-
-        # Saving DataFrame to file
-        df.to_csv(df_path)
-
-    def save_summaries(self, metrics_names: list[str]) -> None:
-        """Create an experiment summary.
-
-        Each dataset-configuration will be represented as a single row of data, which
-        will consist in the mean and standard deviation for the different metric's
-        values across partitions.
+    @classmethod
+    def load(cls, experiment_folder: str | Path) -> Results:
+        """Load an existing experiment folder for post-hoc analysis.
 
         Parameters
         ----------
-        metrics_names : list of str
-            List with the names of all metrics used during the execution of the
-            experiment. Includes computational times.
-
-        """
-        # Name of columns for summary dataframes
-        avg_index = [mn + "_mean" for mn in metrics_names]
-        std_index = [mn + "_std" for mn in metrics_names]
-
-        train_summary = []
-        test_summary = []
-        summary_index = []
-
-        for folder in self._experiment_folder.iterdir():
-            df = pd.read_csv(folder / f"{folder.name}.csv")
-
-            # Creating one entry per folder in summaries
-            tr_sr, ts_sr = self._create_summary(df, avg_index, std_index)
-            train_summary.append(tr_sr)
-            test_summary.append(ts_sr)
-            summary_index.append(folder.name)
-
-        # Naming each row in datasets
-        train_summary = pd.concat(train_summary, axis=1).transpose()
-        train_summary.index = summary_index
-        test_summary = pd.concat(test_summary, axis=1).transpose()
-        test_summary.index = summary_index
-
-        # Save summaries to csv
-        train_summary.to_csv(self._experiment_folder / "train_summary.csv")
-        test_summary.to_csv(self._experiment_folder / "test_summary.csv")
-
-    def _create_summary(
-        self,
-        df: pd.DataFrame,
-        avg_index: list[str],
-        std_index: list[str],
-    ) -> tuple[pd.Series, pd.Series]:
-        """Summarize information from a DataFrame into a single row.
-
-        Parameters
-        ----------
-        df : DataFrame
-            Dataframe representing one Dataset-Configuration. Contains hyper-parameters,
-            metric's scores and computational times.
-
-        avg_index : list of str
-            Includes all names of metrics ending with '_mean'.
-
-        std_index : list of str
-            Includes all names of metrics ending with '_std'.
+        experiment_folder : str or Path
+            Path to an already-populated experiment folder. The folder does not
+            need to exist at construction time; it is only accessed when a
+            method such as :meth:`exists` is called.
 
         Returns
         -------
-        train_summary_row : DataFrame
-            DataFrame with only one row, containing mean and standard deviation for all
-            metrics calculated across partitions (including computational times). Stores
-            only train information.
+        Results
+            A :class:`Results` instance pointing at ``experiment_folder``.
 
-        test_summary_row : DataFrame
-            Stores only test information.
+        Examples
+        --------
+        >>> from pathlib import Path
+        >>> from skordinal.experiments import Results
+        >>> results = Results.load(Path("/path/to/my-run"))  # doctest: +SKIP
 
         """
-        # Dissociating train and test metrics
+        return cls(experiment_folder)
 
-        # Number of parameters used in this configuration
-        n_parameters = len(df.columns) - len(avg_index) * 2
-        # Even columns from dataframe (train metrics)
-        train_df = df.iloc[:, n_parameters::2].copy()
-        # Odd columns (test metrics)
-        test_df = df.iloc[:, (n_parameters + 1) :: 2].copy()
+    def exists(
+        self,
+        classifier_name: str,
+        dataset_name: str,
+        resample_id: str,
+    ) -> bool:
+        """Return whether a partition result has already been saved.
 
-        # Computing mean and standard deviation for metrics
-        train_avg, train_std = train_df.mean(), train_df.std()
-        test_avg, test_std = test_df.mean(), test_df.std()
-        # Naming indexes for summary dataframes
-        train_avg.index = avg_index
-        train_std.index = std_index
-        test_avg.index = avg_index
-        test_std.index = std_index
-        # Merging avg and std into one dataframe
-        train_summary_row = pd.concat([train_avg, train_std])
-        test_summary_row = pd.concat([test_avg, test_std])
+        Parameters
+        ----------
+        classifier_name : str
+            Name of the classifier configuration.
 
-        # Mixing avg and std DataFrame columns from metrics summaries
-        train_summary_row = train_summary_row[
-            list(
-                sum(
-                    zip(
-                        train_summary_row.iloc[: len(avg_index)].keys(),
-                        train_summary_row.iloc[len(std_index) :].keys(),
-                    ),
-                    (),
-                )
+        dataset_name : str
+            Name of the dataset.
+
+        resample_id : str
+            Partition identifier (the CSV row index).
+
+        Returns
+        -------
+        bool
+            ``True`` if the per-pair CSV exists **and** contains a row
+            whose index equals ``resample_id``.
+
+        Examples
+        --------
+        >>> from skordinal.experiments import Results
+        >>> results = Results.load("/path/to/my-run")  # doctest: +SKIP
+        >>> results.exists("SVC", "toy", "0")  # doctest: +SKIP
+        False
+
+        """
+        csv_path = (
+            self._experiment_folder / classifier_name / dataset_name / "report.csv"
+        )
+        if not csv_path.is_file():
+            return False
+        df = pd.read_csv(csv_path, index_col=0)
+        return resample_id in df.index.astype(str)
+
+    def summarize(
+        self,
+        *,
+        labels: Iterable[str] | None = None,
+        split: str = "test",
+    ) -> pd.DataFrame:
+        """Aggregate per-pair CSVs into a multi-index summary DataFrame.
+
+        Parameters
+        ----------
+        labels : iterable of str or None, default=None
+            When provided, only pairs whose classifier name is contained in
+            ``labels`` are included.
+
+        split : {"test", "train", "both"}, default="test"
+            Which metric columns to include.
+
+            - ``"test"``: columns ending with ``_test``.
+            - ``"train"``: columns ending with ``_train``.
+            - ``"both"``: all columns ending with ``_test`` or ``_train``.
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with a ``(classifier, dataset)`` MultiIndex and
+            MultiIndex columns at two levels: outer is the column name (e.g.
+            ``"mae_test"``), inner is ``"mean"`` or ``"std"``.
+            The ``("n_completed", "")`` column counts partitions per pair.
+            Returns an empty :class:`~pandas.DataFrame` when no pairs are found.
+
+        Raises
+        ------
+        ValueError
+            If ``split`` is not ``"test"``, ``"train"``, or ``"both"``.
+        TypeError
+            If ``labels`` is a bare string instead of an iterable of strings.
+
+        Examples
+        --------
+        >>> from skordinal.experiments import Results
+        >>> results = Results.load("/path/to/my-run")  # doctest: +SKIP
+        >>> df = results.summarize(split="both")  # doctest: +SKIP
+
+        """
+        _check_split(split, allow_both=True)
+
+        if isinstance(labels, str):
+            raise TypeError(
+                "labels must be an iterable of classifier name strings, not a bare string; "
+                f"pass [{labels!r}] to filter by a single classifier."
             )
-        ]
 
-        test_summary_row = test_summary_row[
-            list(
-                sum(
-                    zip(
-                        test_summary_row.iloc[: len(avg_index)].keys(),
-                        test_summary_row.iloc[len(std_index) :].keys(),
-                    ),
-                    (),
+        label_set: set[str] | None = set(labels) if labels is not None else None
+        rows: list[dict] = []
+
+        for clf, ds, csv_path in self._iter_pairs():
+            # Skip pairs not in the requested label filter
+            if label_set is not None and clf not in label_set:
+                continue
+
+            df = pd.read_csv(csv_path, index_col=0)
+
+            # Select columns for the requested split
+            if split == "test":
+                metric_cols = [c for c in df.columns if c.endswith("_test")]
+            elif split == "train":
+                metric_cols = [c for c in df.columns if c.endswith("_train")]
+            else:
+                metric_cols = [c for c in df.columns if c.endswith(("_test", "_train"))]
+
+            # Compute mean and std for each metric column
+            row: dict = {"classifier": clf, "dataset": ds}
+            for col in metric_cols:
+                series = df[col].dropna()
+                n = len(series)
+                row[(col, "mean")] = float(series.mean()) if n > 0 else float("nan")
+                row[(col, "std")] = (
+                    float(series.std(ddof=1))
+                    if n > 1
+                    else (0.0 if n == 1 else float("nan"))
                 )
-            )
-        ]
+            row[("n_completed", "")] = len(df)
+            rows.append(row)
 
-        return train_summary_row, test_summary_row
+        if not rows:
+            return pd.DataFrame()
+
+        # Build MultiIndex DataFrame from accumulated rows
+        summary = pd.DataFrame(rows).set_index(["classifier", "dataset"])
+        summary.columns = pd.MultiIndex.from_tuples(list(summary.columns))
+        return summary
+
+    def tabulate(
+        self,
+        *,
+        metric: str = "mean_absolute_error",
+        split: str = "test",
+    ) -> pd.DataFrame:
+        """Pivot experiment results into a classifiers-by-datasets table.
+
+        Parameters
+        ----------
+        metric : str, default="mean_absolute_error"
+            Base metric name. The column ``{metric}_{split}`` is looked up in
+            each per-pair CSV.
+
+        split : {"test", "train"}, default="test"
+            Which evaluation split to read.
+
+        Returns
+        -------
+        pd.DataFrame
+            Pivot DataFrame with classifiers as rows and datasets as columns.
+            Each cell is a ``"mean +/- std"`` string formatted to 4 decimal
+            places, or ``"n/a"`` when the column is absent or all-NaN.
+            Returns an empty :class:`~pandas.DataFrame` when no pairs are found.
+
+        Raises
+        ------
+        ValueError
+            If ``split`` is not ``"test"`` or ``"train"``.
+
+        Examples
+        --------
+        >>> from skordinal.experiments import Results
+        >>> results = Results.load("/path/to/my-run")  # doctest: +SKIP
+        >>> table = results.tabulate(metric="ccr", split="test")  # doctest: +SKIP
+
+        """
+        _check_split(split, allow_both=False)
+
+        col = f"{metric}_{split}"
+        rows: list[dict] = []
+
+        for clf, ds, csv_path in self._iter_pairs():
+            df = pd.read_csv(csv_path, index_col=0)
+            # Format as "mean +/- std", or "n/a" when the metric is absent or all-NaN
+            if col not in df.columns or df[col].isna().all():
+                cell = "n/a"
+            else:
+                series = df[col].dropna()
+                mean = float(series.mean())
+                std = float(series.std(ddof=1)) if len(series) > 1 else 0.0
+                if not math.isfinite(mean):
+                    cell = "n/a"
+                else:
+                    std = std if math.isfinite(std) else 0.0
+                    cell = f"{mean:.4f} +/- {std:.4f}"
+            rows.append({"classifier": clf, "dataset": ds, "value": cell})
+
+        if not rows:
+            return pd.DataFrame()
+
+        # Pivot into a classifiers x datasets table
+        return (
+            pd.DataFrame(rows)
+            .pivot(index="classifier", columns="dataset", values="value")
+            .fillna("n/a")
+            .rename_axis(index="classifier", columns="dataset")
+        )
+
+    def save_summary(self, *, split: str = "test") -> Path:
+        """Write a summary CSV for the requested split to the experiment folder.
+
+        Parameters
+        ----------
+        split : {"test", "train", "both"}, default="test"
+            Which metric columns to include. Passed directly to
+            :meth:`summarize`.
+
+        Returns
+        -------
+        Path
+            Path of the CSV file that was written.
+
+        Raises
+        ------
+        ValueError
+            If ``split`` is not a recognised value or there are no results.
+
+        Examples
+        --------
+        >>> from skordinal.experiments import Results
+        >>> results = Results.load("/path/to/my-run")  # doctest: +SKIP
+        >>> path = results.save_summary(split="test")  # doctest: +SKIP
+
+        """
+        df = self.summarize(split=split)
+        if df.empty:
+            raise ValueError("No results found to summarise.")
+        flat = df.copy()
+        flat.columns = [
+            f"{outer}_{inner}" if inner else outer for outer, inner in flat.columns
+        ]
+        out_path = self._experiment_folder / f"{split}_summary.csv"
+        flat.to_csv(out_path)
+        return out_path
+
+    def _iter_pairs(self) -> Iterator[tuple[str, str, Path]]:
+        """Yield ``(classifier_name, dataset_name, csv_path)`` for each pair."""
+        for clf_dir in sorted(self._experiment_folder.iterdir()):
+            if not clf_dir.is_dir():
+                continue
+            for ds_dir in sorted(clf_dir.iterdir()):
+                if not ds_dir.is_dir():
+                    continue
+                csv_path = ds_dir / "report.csv"
+                if csv_path.is_file():
+                    yield clf_dir.name, ds_dir.name, csv_path
