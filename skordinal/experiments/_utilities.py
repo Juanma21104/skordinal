@@ -11,7 +11,6 @@ from typing import Any, cast
 import numpy as np
 import pandas as pd
 from sklearn import preprocessing
-from sklearn.base import BaseEstimator
 from sklearn.model_selection import GridSearchCV
 
 from skordinal.model_selection import load_classifier
@@ -24,6 +23,93 @@ def _compute_metric(metric_name: str, y_true: np.ndarray, y_pred: np.ndarray) ->
 
     scorer = cast(Any, get_ordinal_scorer(metric_name.strip()))
     return scorer._score_func(y_true, y_pred, **scorer._kwargs)
+
+
+def _read_file(filename: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Read a CSV partition file into ``(inputs, outputs)`` arrays."""
+    # Detect the separator automatically.
+    f = pd.read_csv(filename, header=None, engine="python")
+
+    inputs = f.values[:, 0:(-1)]
+    outputs = f.values[:, (-1)]
+
+    return inputs, outputs
+
+
+def _check_dataset_list(
+    data_path: str | Path, datasets: list[str]
+) -> tuple[str | Path, list[str]]:
+    """Resolve a dataset list, expanding ``["all"]`` and validating entries.
+
+    Expands a home-shorthand ``data_path`` and raises ``ValueError`` if the
+    list contains non-string entries.
+    """
+    base_path = Path(data_path)
+
+    # Check if home path is shortened
+    if str(base_path).startswith("~"):
+        base_path = Path.home() / str(base_path)[1:]
+
+    dataset_list = datasets
+
+    # Check if 'all' is the only value, and if it is, expand it
+    if len(dataset_list) == 1 and dataset_list[0] == "all":
+        dataset_list = [item.name for item in base_path.iterdir() if item.is_dir()]
+
+    elif not all(isinstance(item, str) for item in dataset_list):
+        raise ValueError("Dataset list can only contain strings")
+
+    return str(base_path), dataset_list
+
+
+def _load_dataset(dataset_path: Path) -> list[tuple[str, dict[str, Any]]]:
+    """Load a dataset folder into a sorted list of ``(index, partition)`` tuples.
+
+    Each partition dict disjoins train/test inputs and outputs. Raises
+    ``ValueError`` if the folder is missing and ``RuntimeError`` if a partition
+    has no train file.
+    """
+
+    def get_partition_index(filename: str) -> str:
+        # Extract the index between the last "_" and ".csv".
+        return filename.rsplit("_", 1)[-1].replace(".csv", "")
+
+    try:
+        partition_list: dict[str, dict[str, Any]] = {
+            get_partition_index(filename.name): {}
+            for filename in dataset_path.iterdir()
+            if filename.name.startswith("train_")
+        }
+
+        # Load train and test arrays for each partition.
+        for filename in dataset_path.iterdir():
+            if filename.name.startswith("train_"):
+                idx = get_partition_index(filename.name)
+                train_inputs, train_outputs = _read_file(filename)
+                partition_list[idx]["train_inputs"] = train_inputs
+                partition_list[idx]["train_outputs"] = train_outputs
+
+            elif filename.name.startswith("test_"):
+                idx = get_partition_index(filename.name)
+                test_inputs, test_outputs = _read_file(filename)
+                partition_list[idx]["test_inputs"] = test_inputs
+                partition_list[idx]["test_outputs"] = test_outputs
+
+    except OSError:
+        raise ValueError(f"No such file or directory: '{dataset_path}'")
+
+    except KeyError:
+        raise RuntimeError(
+            f"Found partition without train files: partition {filename.name}"
+        )
+
+    # Sort partitions into a list of (index, partition) tuples.
+    sorted_list: list[tuple[str, dict[str, Any]]] = sorted(
+        partition_list.items(),
+        key=lambda t: int(t[0]) if t[0].lstrip("-").isdigit() else t[0],
+    )
+
+    return sorted_list
 
 
 class Utilities:
@@ -179,378 +265,208 @@ class Utilities:
         """
         self._results = Results(Path(self.results_path))
 
-        self._check_dataset_list()
+        self.data_path, self.datasets = _check_dataset_list(
+            self.data_path, self.datasets
+        )
 
         if self.verbose:
             print("\n###############################")
             print("\tRunning Experiment")
             print("###############################")
 
-        # Iterating over Datasets
+        # Iterate over datasets.
         for x in self.datasets:
             dataset_name = x.strip()
             dataset_path = Path(self.data_path) / dataset_name
 
-            dataset = self._load_dataset(dataset_path)
+            dataset = _load_dataset(dataset_path)
 
             if self.verbose:
                 print("\nRunning", dataset_name, "dataset")
                 print("--------------------------")
 
-            # Iterating over Configurations
+            # Iterate over configurations.
             for conf_name, configuration in self.configurations.items():
                 if self.verbose:
                     print("Running", conf_name, "...")
 
-                # Iterating over partitions
+                # Iterate over partitions.
                 for part_idx, partition in dataset:
                     if self.verbose:
                         print("  Running Partition", part_idx)
 
-                    # Normalisation or standardisation of the partition if requested
-                    if self.input_preprocessing == "norm":
-                        partition["train_inputs"], partition["test_inputs"] = (
-                            self._normalize_data(
-                                partition["train_inputs"], partition["test_inputs"]
-                            )
-                        )
-                    elif self.input_preprocessing == "std":
-                        partition["train_inputs"], partition["test_inputs"] = (
-                            self._standardize_data(
-                                partition["train_inputs"], partition["test_inputs"]
-                            )
-                        )
-
-                    optimal_estimator = self._get_optimal_estimator(
+                    result = self._run_single(
                         partition["train_inputs"],
                         partition["train_outputs"],
-                        configuration["classifier"],
-                        configuration["parameters"],
+                        partition.get("test_inputs"),
+                        partition.get("test_outputs"),
+                        configuration,
+                        dataset_name=dataset_name,
+                        conf_name=conf_name,
+                        resample_id=part_idx,
                     )
+                    self._results.save(result)
 
-                    # Getting train and test predictions
-                    train_predicted_y = optimal_estimator.predict(
-                        partition["train_inputs"]
-                    )
-
-                    test_predicted_y = None
-                    elapsed = np.nan
-                    if "test_outputs" in partition:
-                        start = time()
-                        test_predicted_y = np.asarray(
-                            optimal_estimator.predict(partition["test_inputs"])
-                        )
-                        elapsed = time() - start
-
-                    # Obtaining train and test metrics values.
-                    train_metrics = OrderedDict()
-                    test_metrics = OrderedDict()
-                    for metric_name in self.eval_metrics:
-                        # Get train scores
-                        train_score = _compute_metric(
-                            metric_name,
-                            partition["train_outputs"],
-                            train_predicted_y,
-                        )
-                        train_metrics[metric_name.strip() + "_train"] = train_score
-
-                        # Get test scores
-                        test_metrics[metric_name.strip() + "_test"] = np.nan
-                        if "test_outputs" in partition:
-                            assert test_predicted_y is not None
-                            test_score = _compute_metric(
-                                metric_name, partition["test_outputs"], test_predicted_y
-                            )
-                            test_metrics[metric_name.strip() + "_test"] = test_score
-
-                    # Cross-validation was performed to tune hyper-parameters
-                    if isinstance(optimal_estimator, GridSearchCV):
-                        train_metrics["cv_time_train"] = optimal_estimator.cv_results_[
-                            "mean_fit_time"
-                        ].mean()
-                        test_metrics["cv_time_test"] = optimal_estimator.cv_results_[
-                            "mean_score_time"
-                        ].mean()
-                        train_metrics["time_train"] = optimal_estimator.refit_time_
-                        test_metrics["time_test"] = elapsed
-
-                    else:
-                        optimal_estimator.best_params_ = configuration["parameters"]
-                        optimal_estimator.best_estimator_ = optimal_estimator
-
-                        train_metrics["cv_time_train"] = np.nan
-                        test_metrics["cv_time_test"] = np.nan
-                        train_metrics["time_train"] = optimal_estimator.refit_time_
-                        test_metrics["time_test"] = elapsed
-
-                    y_proba = None
-                    if "test_outputs" in partition and hasattr(
-                        optimal_estimator.best_estimator_, "predict_proba"
-                    ):
-                        y_proba = optimal_estimator.best_estimator_.predict_proba(
-                            partition["test_inputs"]
-                        )
-
-                    # Saving the results for this partition
-                    self._results.save(
-                        ExperimentResult(
-                            dataset_name=dataset_name,
-                            classifier_name=conf_name,
-                            resample_id=part_idx,
-                            train_predicted_y=train_predicted_y,
-                            test_predicted_y=test_predicted_y,
-                            y_proba=y_proba,
-                            train_metrics=train_metrics,
-                            test_metrics=test_metrics,
-                            best_params=optimal_estimator.best_params_,
-                            best_model=optimal_estimator.best_estimator_,
-                            train_true_y=partition["train_outputs"],
-                            test_true_y=partition.get("test_outputs"),
-                        )
-                    )
-
-    def _load_dataset(self, dataset_path: Path) -> list[tuple[str, dict[str, Any]]]:
-        """Load all dataset's files, divided into train and test.
-
-        Parameters
-        ----------
-        dataset_path : Path
-            Path to dataset folder.
-
-        Returns
-        -------
-        partition_list : list of tuples
-            List of partitions found inside a dataset folder. Each partition is
-            stored into a dictionary, disjoining train and test inputs and
-            outputs.
-
-        Raises
-        ------
-        ValueError
-            If the dataset path does not exist.
-
-        RuntimeError
-            If a partition is found without train files.
-
-        """
-
-        def get_partition_index(filename: str) -> str:
-            # Extracts the index between the last "_" and ".csv"
-            return filename.rsplit("_", 1)[-1].replace(".csv", "")
-
-        try:
-            partition_list: dict[str, dict[str, Any]] = {
-                get_partition_index(filename.name): {}
-                for filename in dataset_path.iterdir()
-                if filename.name.startswith("train_")
-            }
-
-            # Loading each dataset
-            for filename in dataset_path.iterdir():
-                if filename.name.startswith("train_"):
-                    idx = get_partition_index(filename.name)
-                    train_inputs, train_outputs = self._read_file(filename)
-                    partition_list[idx]["train_inputs"] = train_inputs
-                    partition_list[idx]["train_outputs"] = train_outputs
-
-                elif filename.name.startswith("test_"):
-                    idx = get_partition_index(filename.name)
-                    test_inputs, test_outputs = self._read_file(filename)
-                    partition_list[idx]["test_inputs"] = test_inputs
-                    partition_list[idx]["test_outputs"] = test_outputs
-
-        except OSError:
-            raise ValueError(f"No such file or directory: '{dataset_path}'")
-
-        except KeyError:
-            raise RuntimeError(
-                f"Found partition without train files: partition {filename.name}"
-            )
-
-        # Saving partitions as a sorted list of (index, partition) tuples
-        sorted_list: list[tuple[str, dict[str, Any]]] = sorted(
-            partition_list.items(),
-            key=lambda t: int(t[0]) if t[0].lstrip("-").isdigit() else t[0],
-        )
-
-        return sorted_list
-
-    def _read_file(self, filename: Path) -> tuple[np.ndarray, np.ndarray]:
-        """Read a CSV containing partitions, or full datasets.
-
-        Train and test files must be previously divided for the experiment to run.
-
-        Parameters
-        ----------
-        filename : str or Path
-            Full path to train or test file.
-
-        Returns
-        -------
-        inputs : {array-like, sparse-matrix} of shape (n_samples, n_features)
-            Vector of sample's features.
-
-        outputs : array-like of shape (n_samples)
-            Target vector relative to inputs.
-
-        """
-        # Separator is automatically found
-        f = pd.read_csv(filename, header=None, engine="python")
-
-        inputs = f.values[:, 0:(-1)]
-        outputs = f.values[:, (-1)]
-
-        return inputs, outputs
-
-    def _check_dataset_list(self) -> None:
-        """Check if there is some inconsistency in the dataset list.
-
-        It also simplifies running all datasets inside one folder.
-
-        Raises
-        ------
-        ValueError
-            If the dataset list is inconsistent or contains non-string values.
-
-        """
-        base_path = Path(self.data_path)
-
-        # Check if home path is shortened
-        if str(base_path).startswith("~"):
-            base_path = Path.home() / str(base_path)[1:]
-
-        dataset_list = self.datasets
-
-        # Check if 'all' is the only value, and if it is, expand it
-        if len(dataset_list) == 1 and dataset_list[0] == "all":
-            dataset_list = [item.name for item in base_path.iterdir() if item.is_dir()]
-
-        elif not all(isinstance(item, str) for item in dataset_list):
-            raise ValueError("Dataset list can only contain strings")
-
-        self.data_path = str(base_path)
-        self.datasets = dataset_list
-
-    def _normalize_data(
-        self, train_data: np.ndarray, test_data: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Normalize the data.
-
-        Test data normalization will be based on train data.
-
-        Parameters
-        ----------
-        train_data : 2d array
-            Contain the train data features.
-
-        test_data : 2d array
-            Contain the test data features.
-
-        Returns
-        -------
-        train_normalized : np.ndarray
-            Normalized training data.
-
-        test_normalized : np.ndarray
-            Normalized test data.
-
-        """
-        mm_scaler = preprocessing.MinMaxScaler().fit(train_data)
-
-        return mm_scaler.transform(train_data), mm_scaler.transform(test_data)
-
-    def _standardize_data(
-        self, train_data: np.ndarray, test_data: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Standardize the data.
-
-        Test data standardization will be based on train data.
-
-        Parameters
-        ----------
-        train_data : 2d array
-            Contain the train data features.
-
-        test_data : 2d array
-            Contain the test data features.
-
-        Returns
-        -------
-        train_standardized : np.ndarray
-            Standardized training data.
-
-        test_standardized : np.ndarray
-            Standardized test data.
-
-        """
-        std_scaler = preprocessing.StandardScaler().fit(train_data)
-
-        return std_scaler.transform(train_data), std_scaler.transform(test_data)
-
-    def _get_optimal_estimator(
+    def _run_single(
         self,
-        train_inputs: np.ndarray,
-        train_outputs: np.ndarray,
-        classifier_name: str,
-        parameters: dict[str, Any],
-    ) -> BaseEstimator | GridSearchCV:
-        """Perform cross-validation over one dataset and configuration.
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_test: np.ndarray | None,
+        y_test: np.ndarray | None,
+        configuration: dict[str, Any],
+        *,
+        dataset_name: str,
+        conf_name: str,
+        resample_id: str,
+    ) -> ExperimentResult:
+        """Run one classifier configuration on a single train/test partition.
 
-        Each configuration consists of one classifier and none, one or multiple
-        hyper-parameters, that, in turn, can contain one or multiple values used
-        to optimize the resulting model.
-
-        At the end of cross-validation phase, the model with the specific
-        combination of values from the hyper-parameters that achieved the best
-        metrics from all the combinations will remain.
+        This is the single-partition execution unit. It applies optional
+        preprocessing, selects and fits the best estimator, predicts on train
+        and (when present) test splits, computes all evaluation metrics and
+        timing keys, and returns an :class:`ExperimentResult`. It does **not**
+        persist anything to disk; the caller is responsible for calling
+        ``self._results.save(result)`` after this method returns.
 
         Parameters
         ----------
-        train_inputs : {array-like, sparse-matrix} of shape (n_samples, n_features)
-            Vector of features for each sample for this dataset.
+        X_train : ndarray of shape (n_train_samples, n_features)
+            Training feature matrix.
 
-        train_outputs : array-like of shape (n_samples)
-            Target vector relative to train_inputs.
+        y_train : ndarray of shape (n_train_samples,)
+            Training labels.
 
-        classifier_name : str
-            Name of the classification algorithm being employed.
+        X_test : ndarray of shape (n_test_samples, n_features) or None
+            Test feature matrix. When ``None`` no test metrics are computed.
 
-        parameters : dict
-            Dictionary containing parameters to optimize as keys, and the list
-            of values that we want to compare as values.
+        y_test : ndarray of shape (n_test_samples,) or None
+            Test labels. When ``None`` no test metrics are computed.
+
+        configuration : dict
+            Single configuration entry with the form
+            ``{"classifier": str, "parameters": dict}``.
+
+        dataset_name : str
+            Name of the dataset, forwarded to the returned
+            :class:`ExperimentResult`.
+
+        conf_name : str
+            Configuration label, used as ``classifier_name`` in the returned
+            :class:`ExperimentResult`.
+
+        resample_id : str
+            Partition index string, forwarded to the returned
+            :class:`ExperimentResult`.
 
         Returns
         -------
-        optimal : GridSearchCV object or classifier object
-            An already fitted model of the given classifier, with the best found
-            parameters after cross-validation. If cross-validation is not needed,
-            it will return the classifier model already trained.
-
-        Raises
-        ------
-        ValueError
-            If the classifier name is unknown or a hyper-parameter is invalid.
+        ExperimentResult
+            Fully populated result for this partition. No side effects.
 
         """
-        estimator = load_classifier(
-            classifier_name=classifier_name,
+        # Apply preprocessing on local copies so the caller's arrays are not mutated.
+        train_inputs: np.ndarray = X_train
+        test_inputs: np.ndarray | None = X_test
+
+        if self.input_preprocessing == "norm":
+            scaler = preprocessing.MinMaxScaler().fit(train_inputs)
+            train_inputs = scaler.transform(train_inputs)
+            test_inputs = scaler.transform(cast(np.ndarray, X_test))
+        elif self.input_preprocessing == "std":
+            scaler = preprocessing.StandardScaler().fit(train_inputs)
+            train_inputs = scaler.transform(train_inputs)
+            test_inputs = scaler.transform(cast(np.ndarray, X_test))
+
+        # Select and fit the best estimator via GridSearchCV or direct fit.
+        optimal_estimator: Any = load_classifier(
+            classifier_name=configuration["classifier"],
             random_state=self.random_state,
             n_jobs=self.n_jobs,
             cv_n_folds=self.cv,
             cv_metric=self.tuning_metric,
-            param_grid=parameters,
+            param_grid=configuration["parameters"],
         )
 
-        start = time()
-        estimator.fit(train_inputs, train_outputs)
-        elapsed = time() - start
+        _fit_start = time()
+        optimal_estimator.fit(train_inputs, y_train)
+        _fit_elapsed = time() - _fit_start
 
-        if not isinstance(estimator, GridSearchCV):
-            estimator.refit_time_ = elapsed
-            estimator.best_params_ = parameters
-            estimator.best_estimator_ = estimator
+        if not isinstance(optimal_estimator, GridSearchCV):
+            optimal_estimator.refit_time_ = _fit_elapsed
+            optimal_estimator.best_params_ = configuration["parameters"]
+            optimal_estimator.best_estimator_ = optimal_estimator
 
-        return estimator
+        # Predict on the training split.
+        train_predicted_y = optimal_estimator.predict(train_inputs)
+
+        # Predict on the test split when it is present.
+        test_predicted_y = None
+        elapsed = np.nan
+        if y_test is not None:
+            assert test_inputs is not None
+            start = time()
+            test_predicted_y = np.asarray(optimal_estimator.predict(test_inputs))
+            elapsed = time() - start
+
+        # Compute evaluation metrics for both splits.
+        train_metrics: OrderedDict[str, Any] = OrderedDict()
+        test_metrics: OrderedDict[str, Any] = OrderedDict()
+        for metric_name in self.eval_metrics:
+            train_score = _compute_metric(
+                metric_name,
+                y_train,
+                train_predicted_y,
+            )
+            train_metrics[metric_name.strip() + "_train"] = train_score
+
+            test_metrics[metric_name.strip() + "_test"] = np.nan
+            if y_test is not None:
+                assert test_predicted_y is not None
+                test_score = _compute_metric(metric_name, y_test, test_predicted_y)
+                test_metrics[metric_name.strip() + "_test"] = test_score
+
+        # Assemble timing keys (GridSearchCV vs direct-fit branches).
+        if isinstance(optimal_estimator, GridSearchCV):
+            train_metrics["cv_time_train"] = optimal_estimator.cv_results_[
+                "mean_fit_time"
+            ].mean()
+            test_metrics["cv_time_test"] = optimal_estimator.cv_results_[
+                "mean_score_time"
+            ].mean()
+            train_metrics["time_train"] = optimal_estimator.refit_time_
+            test_metrics["time_test"] = elapsed
+        else:
+            optimal_estimator.best_params_ = configuration["parameters"]
+            optimal_estimator.best_estimator_ = optimal_estimator
+
+            train_metrics["cv_time_train"] = np.nan
+            test_metrics["cv_time_test"] = np.nan
+            train_metrics["time_train"] = optimal_estimator.refit_time_
+            test_metrics["time_test"] = elapsed
+
+        # Compute class probabilities when available.
+        y_proba = None
+        if y_test is not None and hasattr(
+            optimal_estimator.best_estimator_, "predict_proba"
+        ):
+            assert test_inputs is not None
+            y_proba = optimal_estimator.best_estimator_.predict_proba(test_inputs)
+
+        # Build and return the ExperimentResult; no persistence here.
+        return ExperimentResult(
+            dataset_name=dataset_name,
+            classifier_name=conf_name,
+            resample_id=resample_id,
+            train_predicted_y=train_predicted_y,
+            test_predicted_y=test_predicted_y,
+            y_proba=y_proba,
+            train_metrics=train_metrics,
+            test_metrics=test_metrics,
+            best_params=optimal_estimator.best_params_,
+            best_model=optimal_estimator.best_estimator_,
+            train_true_y=y_train,
+            test_true_y=y_test,
+        )
 
     def write_report(self) -> None:
         """Save summarized information about experiment through Results class."""
