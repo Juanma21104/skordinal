@@ -146,12 +146,12 @@ def test_optimizer_uses_lbfgs_and_unpacks_result(data, monkeypatch):
         "skordinal.classifiers._mlp_base.scipy.optimize.minimize", fake_minimize
     )
 
-    clf = DummyMLP(max_iter=17, verbose=True).fit(X, y)
+    clf = DummyMLP(max_iter=17).fit(X, y)
 
     assert calls == {
         "method": "L-BFGS-B",
         "jac": True,
-        "options": {"maxiter": 17, "disp": True},
+        "options": {"maxiter": 17},
     }
     assert clf.n_iter_ == 4
     np.testing.assert_array_equal(clf.weights_, np.ones_like(clf.weights_))
