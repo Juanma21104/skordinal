@@ -1,14 +1,13 @@
 """Base class for Multi-Layer Perceptron classifiers."""
 
 from abc import ABC, abstractmethod
+from numbers import Integral, Real
 
 import numpy as np
 import scipy.optimize
-from numbers import Integral, Real
-
-from sklearn.utils._param_validation import Interval, StrOptions
 from sklearn.base import BaseEstimator, ClassifierMixin, _fit_context
-from sklearn.utils import compute_sample_weight, check_random_state
+from sklearn.utils import check_random_state, compute_sample_weight
+from sklearn.utils._param_validation import Interval, StrOptions
 from sklearn.utils.validation import check_is_fitted, validate_data
 
 from skordinal.utils.validation import check_ordinal_targets
@@ -21,22 +20,22 @@ class MLPBaseClassifier(ClassifierMixin, BaseEstimator, ABC):
     ----------
     n_hidden_layers : int, default=1
         Number of hidden layers in the network.
-        
+
     n_hidden_units : int, default=64
         Number of neurons per hidden layer.
-        
+
     alpha : float, default=0.01
         L2 regularization parameter.
-        
+
     class_weight : dict, "balanced", or None, default=None
-        Weights associated with classes. 
-        
+        Weights associated with classes.
+
     max_iter : int, default=500
         Maximum number of iterations for the solver.
-        
+
     random_state : int, RandomState instance or None, default=None
         Determines random number generation for weight initialization.
-        
+
     verbose : bool, default=False
         Whether to print progress messages to stdout during training.
     """
@@ -72,7 +71,7 @@ class MLPBaseClassifier(ClassifierMixin, BaseEstimator, ABC):
     @abstractmethod
     def _initialize_parameters(self, rng: np.random.RandomState) -> np.ndarray:
         """Initialize and return all network weights as a single 1D array.
-        
+
         Parameters
         ----------
         rng : RandomState instance
@@ -87,14 +86,14 @@ class MLPBaseClassifier(ClassifierMixin, BaseEstimator, ABC):
 
     @abstractmethod
     def _cost_and_grad(
-        self, 
-        params: np.ndarray, 
-        X: np.ndarray, 
-        Y: np.ndarray, 
-        sample_weight: np.ndarray
+        self,
+        params: np.ndarray,
+        X: np.ndarray,
+        Y: np.ndarray,
+        sample_weight: np.ndarray,
     ) -> tuple[float, np.ndarray]:
         """Compute the cost and gradients.
-        
+
         Parameters
         ----------
         params : ndarray
@@ -123,24 +122,24 @@ class MLPBaseClassifier(ClassifierMixin, BaseEstimator, ABC):
     @_fit_context(prefer_skip_nested_validation=True)
     def fit(self, X, y):
         """Fit the model using L-BFGS-B optimizer.
-        
+
         Parameters
         ----------
         X : {array-like, sparse matrix} of shape (n_samples, n_features)
             The training input samples.
-            
+
         y : array-like of shape (n_samples,)
             The target values (class labels).
-            
+
         Returns
         -------
         self : object
             Returns a fitted instance of self.
         """
         X, y = validate_data(self, X=X, y=y, reset=True)
-        
+
         self.classes_, y_encoded = check_ordinal_targets(y)
-        
+
         self.num_classes_ = len(self.classes_)
         self.input_shape_ = X.shape[1]
         n_samples = X.shape[0]
@@ -154,7 +153,7 @@ class MLPBaseClassifier(ClassifierMixin, BaseEstimator, ABC):
             sample_weight *= sw
 
         rng = check_random_state(self.random_state)
-        
+
         params0 = self._initialize_parameters(rng)
 
         res = scipy.optimize.minimize(
@@ -175,12 +174,12 @@ class MLPBaseClassifier(ClassifierMixin, BaseEstimator, ABC):
 
     def predict_proba(self, X):
         """Predict class probabilities for X.
-        
+
         Parameters
         ----------
         X : {array-like, sparse matrix} of shape (n_samples, n_features)
             The input data.
-            
+
         Returns
         -------
         p : ndarray of shape (n_samples, n_classes)
@@ -192,12 +191,12 @@ class MLPBaseClassifier(ClassifierMixin, BaseEstimator, ABC):
 
     def predict(self, X):
         """Predict the class for the samples in X.
-        
+
         Parameters
         ----------
         X : {array-like, sparse matrix} of shape (n_samples, n_features)
             The input data.
-            
+
         Returns
         -------
         y_pred : ndarray of shape (n_samples,)
@@ -205,5 +204,5 @@ class MLPBaseClassifier(ClassifierMixin, BaseEstimator, ABC):
         """
         probas = self.predict_proba(X)
         indices = np.argmax(probas, axis=1)
-        
+
         return self.classes_[indices]
