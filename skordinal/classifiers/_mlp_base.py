@@ -162,7 +162,7 @@ class MLPBaseClassifier(ClassifierMixin, BaseEstimator, ABC):
             args=(X, Y_target, sample_weight),
             method="L-BFGS-B",
             jac=True,
-            options={"maxiter": self.max_iter, "disp": self.verbose},
+            options={"maxiter": self.max_iter},
         )
 
         self.loss_ = res.fun
